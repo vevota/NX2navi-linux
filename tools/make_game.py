@@ -73,10 +73,32 @@ LIFT_FIXES = [
      '    { uint64_t ea = x8 + 0x1f0ull; uint64_t v = LD64(ea); x8 = (uint64_t)(v); }\n'
      '    if (x8) c->tpidr = x8;   /* zero slot: keep the host\'s TLS (make_game.py) */\n'),
 ]
-LINK_LIBS = ['-lvulkan-1', '-lSDL3', '-lopus', '-lvpx', '-l:libdav1d.a', '-lzstd', '-l:libatomic.a', '-lbcrypt',
-             '-limm32', '-luuid', '-lole32', '-luser32', '-lshell32', '-lgdi32', '-ladvapi32', '-lwinmm']
+WIN = os.name == 'nt'
+
+if WIN:
+    LINK_LIBS = ['-lvulkan-1', '-lSDL3', '-lopus', '-lvpx', '-l:libdav1d.a', '-lzstd', '-l:libatomic.a', '-lbcrypt',
+                 '-limm32', '-luuid', '-lole32', '-luser32', '-lshell32', '-lgdi32', '-ladvapi32', '-lwinmm']
+    LINK_FLAGS = []   # -L of the MSYS2 folders is added where the link runs
+    EXE_NAME = 'ocarina.exe'
+else:
+    # The system's Vulkan, SDL3, Opus, libvpx, dav1d and zstd; libstdc++ static and an $ORIGIN rpath, so the game runs
+    # from any folder with nothing but the system's Vulkan loader (tools/build_game.py links its Linux build the same
+    # way). -no-pie: the lifted modules' function tables need no load-time relocation.
+    LINK_LIBS = ['-lvulkan', '-lSDL3', '-lopus', '-lvpx', '-ldav1d', '-lzstd', '-latomic', '-l:libstdc++.a',
+                 '-lm', '-lpthread', '-ldl']
+    LINK_FLAGS = ['-fuse-ld=lld', '-no-pie', '-Wl,-z,noexecstack', '-Wl,-z,stack-size=16777216',
+                  '-Wl,-rpath,$ORIGIN']
+    EXE_NAME = 'ocarina'
 SYSTEM_DLLS_SKIP = {'vulkan-1.dll'}   # the graphics driver's loader, never a copy
-EXE_NAME = 'ocarina.exe'
+
+
+def xlate_path(name):
+    """The shader translator's files: bin/ in a release folder, build/xlate after tools/build_xlate.py in a checkout."""
+    for folder in (KIT / 'bin', KIT / 'build' / 'xlate'):
+        if (folder / name).is_file():
+            return folder / name
+    return KIT / 'bin' / name
+
 
 # Runs a script the way `python script.py` does, with the script's folder first on sys.path. The launcher's
 # embeddable Python leaves the script folder off sys.path (its ._pth file), so every script this build starts goes
@@ -578,19 +600,35 @@ def step_compile(out, cache_dir, msys, jobs):
     gen.mkdir(parents=True, exist_ok=True)
     obj.mkdir(parents=True, exist_ok=True)
     rt = KIT / 'runtime'
-    clang, clangxx = msys / 'bin' / 'clang.exe', msys / 'bin' / 'clang++.exe'
-    env = dict(os.environ, PATH=str(msys / 'bin') + os.pathsep + os.environ.get('PATH', ''))
+    if WIN:
+        clang, clangxx = msys / 'bin' / 'clang.exe', msys / 'bin' / 'clang++.exe'
+        env = dict(os.environ, PATH=str(msys / 'bin') + os.pathsep + os.environ.get('PATH', ''))
+        vma = msys / 'include' / 'vma'
+    else:
+        # The system's clang, lld and Ninja (docs/README-BuildKit.md lists the packages). runtime/platform/linux.c and
+        # the *_sdl.* window take the place of the Win32 files.
+        clang, clangxx = shutil.which('clang'), shutil.which('clang++')
+        env = dict(os.environ)
+        vma = KIT / 'toolchain' / 'vma'
+        if not (vma / 'vk_mem_alloc.h').is_file():
+            vma = Path('/usr/include')   # a system vk_mem_alloc.h
     if subprocess.run(py_cmd(KIT / 'tools' / 'romfs_index.py', '--romfs', out / 'romfs', '--out', gen)).returncode:
         fail('the RomFS index could not be written')
     srcs = [(p, obj / f'{mod}_{p.stem}.o') for mod in ('main', 'sdk', 'subsdk0') for p in sorted((lift / mod).glob('*.c'))]
     for pat in ('*.c', '*.cpp', 'platform/*.c', 'ui/*.cpp', 'third_party/imgui/*.cpp', 'third_party/imgui/backends/*.cpp'):
         for p in sorted(rt.glob(pat)):
-            if p.stem.endswith('_sdl') or p.name == 'linux.c':
+            if WIN and (p.stem.endswith('_sdl') or p.name == 'linux.c'):
+                continue
+            if not WIN and (p.stem.endswith('_win') or p.name == 'win32.c'):
                 continue
             srcs.append((p, obj / ('rt_' + p.relative_to(rt).as_posix().replace('/', '_').rsplit('.', 1)[0] + '.o')))
-    srcs += [(modules_c(lift, out, gen), obj / 'modules.o'), (gen / 'shim.c', obj / 'shim.o')]
+    srcs += [(modules_c(lift, out, gen), obj / 'modules.o')]
+    if WIN:
+        # The Win32 build compiles no SDL source, so it defines menu_sdl_event here (runtime/ui/menu_sdl.cpp defines it
+        # in the Linux build).
+        srcs.append((gen / 'shim.c', obj / 'shim.o'))
     inc = ['-I', str(rt), '-I', str(lift), '-I', str(gen), '-I', str(rt / 'third_party' / 'imgui'),
-           '-I', str(msys / 'include' / 'vma')]
+           '-I', str(vma)]
     cid = compiler_id(clang, env)
 
     def cmd_for(src, dst):
@@ -598,8 +636,9 @@ def step_compile(out, cache_dir, msys, jobs):
         # the lifted code at -O1 (its size makes -O2 slow to build), the runtime at -O2; neither may assume strict aliasing:
         # the lifted code reaches guest memory through casts of one address to several types (tools/build_game.py's flags)
         guest = dst.name.startswith(('main_', 'sdk_', 'subsdk0_'))
-        return [str(clangxx if cpp else clang), '-c', '-std=gnu++17' if cpp else '-std=gnu11', '-O1' if guest else '-O2',
-                '-fno-strict-aliasing', '-w', *inc, '-o', str(dst), str(src)]
+        pie = [] if WIN else ['-fno-pie', '-fdeclspec']   # -fdeclspec: the third-party FFX headers use __declspec
+        return [str(clangxx if cpp else clang), '-c', *pie, '-std=gnu++17' if cpp else '-std=gnu11',
+                '-O1' if guest else '-O2', '-fno-strict-aliasing', '-w', *inc, '-o', str(dst), str(src)]
 
     t0 = time.time()
     last = [0.0]
@@ -622,13 +661,15 @@ def step_compile(out, cache_dir, msys, jobs):
         fail(f'{len(bad)} files did not compile')
 
     # the manifest (per-monitor DPI awareness: the picture at the monitor's real size, not one Windows stretches) and the
-    # icon, runtime/nx2navi.rc through MSYS2's windres
-    rco = obj / 'nx2navi_rc.o'
-    r = subprocess.run([str(msys / 'bin' / 'windres.exe'), '-I', str(rt), '-O', 'coff', '-i', str(rt / 'nx2navi.rc'),
-                        '-o', str(rco)], capture_output=True, text=True, env=env, errors='replace')
-    if r.returncode:
-        fail(f'windres failed on runtime/nx2navi.rc: {r.stderr.strip()[:400]}')
-    objs = [o for _, o in srcs] + [rco]
+    # icon, runtime/nx2navi.rc through MSYS2's windres (Windows only: Linux has no resource file)
+    objs = [o for _, o in srcs]
+    if WIN:
+        rco = obj / 'nx2navi_rc.o'
+        r = subprocess.run([str(msys / 'bin' / 'windres.exe'), '-I', str(rt), '-O', 'coff', '-i', str(rt / 'nx2navi.rc'),
+                            '-o', str(rco)], capture_output=True, text=True, env=env, errors='replace')
+        if r.returncode:
+            fail(f'windres failed on runtime/nx2navi.rc: {r.stderr.strip()[:400]}')
+        objs.append(rco)
     exe = out / EXE_NAME
     rsp = cache_dir / 'link.rsp'
     rsp.write_text('\n'.join('"%s"' % o.as_posix() for o in objs), encoding='utf-8')
@@ -636,13 +677,15 @@ def step_compile(out, cache_dir, msys, jobs):
                                                           for o in objs]).encode())
     state_link = cache_dir / 'link.key'
     if exe.is_file() and state_link.is_file() and state_link.read_text(encoding='utf-8') == link_key:
-        say('  ocarina.exe is current, not linked again')
+        say(f'  {EXE_NAME} is current, not linked again')
     else:
         emit('phase', step='compile', phase='link')
         say('  linking')
         tmp = out / (EXE_NAME + '.new')
-        p = subprocess.run([str(clangxx), '-o', str(tmp), '@' + str(rsp), '-L', str(msys / 'lib'), *LINK_LIBS],
-                           capture_output=True, text=True, env=env, errors='replace')
+        link = [str(clangxx), *LINK_FLAGS, '-o', str(tmp), '@' + str(rsp)]
+        if WIN:
+            link += ['-L', str(msys / 'lib')]
+        p = subprocess.run(link + LINK_LIBS, capture_output=True, text=True, env=env, errors='replace')
         if p.returncode:
             print(p.stderr[-4000:], file=sys.stderr)
             tmp.unlink(missing_ok=True)
@@ -654,11 +697,15 @@ def step_compile(out, cache_dir, msys, jobs):
             fail(f'{exe} is in use: close the game and try again')
         state_link.write_text(link_key, encoding='utf-8')
     copy_if_changed(gen / 'romfs-index.bin', out / 'romfs-index.bin')
-    for name in ('nx2navi_xlate.exe', 'nx2navi_xlate.id'):
-        copy_if_changed(KIT / 'bin' / name, out / name)
-    if (KIT / 'bin' / 'amd_fidelityfx_vk.dll').is_file():   # FSR 3.1 (runtime/vk_ffx.cpp)
-        copy_if_changed(KIT / 'bin' / 'amd_fidelityfx_vk.dll', out / 'amd_fidelityfx_vk.dll')
-    say(f'  {EXE_NAME} {exe.stat().st_size / 1e6:.0f} MB; beside it: {", ".join(copy_dlls(exe, msys / "bin", out))}')
+    for name in (('nx2navi_xlate.exe', 'nx2navi_xlate.id') if WIN else ('nx2navi_xlate', 'nx2navi_xlate.id')):
+        copy_if_changed(xlate_path(name), out / name)
+    if WIN:
+        if (KIT / 'bin' / 'amd_fidelityfx_vk.dll').is_file():   # FSR 3.1 (runtime/vk_ffx.cpp)
+            copy_if_changed(KIT / 'bin' / 'amd_fidelityfx_vk.dll', out / 'amd_fidelityfx_vk.dll')
+        say(f'  {EXE_NAME} {exe.stat().st_size / 1e6:.0f} MB; beside it: '
+            f'{", ".join(copy_dlls(exe, msys / "bin", out))}')
+    else:
+        say(f'  {EXE_NAME} {exe.stat().st_size / 1e6:.0f} MB')
     (out / 'profile').mkdir(exist_ok=True)
 
 
@@ -667,7 +714,7 @@ def step_compile(out, cache_dir, msys, jobs):
 def step_shaders(out):
     """Every shader of the game files into the game's shader cache and the driver's own cache, before the first start."""
     cmd = [sys.executable, str(KIT / 'tools' / 'prepare_shaders.py'), str(out), '--romfs', str(out / 'romfs'),
-           '--exefs', str(out / 'exefs'), '--no-list', '--exe', 'ocarina.exe']
+           '--exefs', str(out / 'exefs'), '--no-list', '--exe', EXE_NAME]
     if subprocess.run(cmd).returncode:
         fail('preparing the shaders failed (the lines above say why); the game still runs, compiling shaders as it '
              'meets them. Run the build again to retry this step')
@@ -714,7 +761,8 @@ def step_key(step, identity, out=None):
     if step == 'compile':
         return compile_key
     # shaders: the built game and the translator that prepared them
-    return f'shaders-1|{compile_key}|{sha256_file(KIT / "tools" / "prepare_shaders.py")}|{sha256_file(KIT / "bin" / "nx2navi_xlate.id")}'
+    return f'shaders-1|{compile_key}|{sha256_file(KIT / "tools" / "prepare_shaders.py")}|' \
+           f'{sha256_file(xlate_path("nx2navi_xlate.id"))}'
 
 
 def main():
@@ -753,10 +801,15 @@ def main():
         return
     if not out:
         ap.error('--out is needed to build')
-    msys = Path(a.msys)
-    for need in ('bin/clang.exe', 'bin/clang++.exe', 'bin/SDL3.dll', 'lib/libSDL3.dll.a', 'include/vma'):
-        if not (msys / need).exists():
-            fail(f'{msys / need} is missing: install MSYS2 and the packages README-BuildKit.md lists')
+    msys = Path(a.msys) if WIN else None
+    if WIN:
+        for need in ('bin/clang.exe', 'bin/clang++.exe', 'bin/SDL3.dll', 'lib/libSDL3.dll.a', 'include/vma'):
+            if not (msys / need).exists():
+                fail(f'{msys / need} is missing: install MSYS2 and the packages README-BuildKit.md lists')
+    else:
+        missing = [n for n in ('clang', 'clang++', 'ld.lld', 'ninja') if not shutil.which(n)]
+        if missing:
+            fail(f'{", ".join(missing)} not found on PATH: install clang, lld and ninja (docs/README-BuildKit.md)')
     for mod in ('numpy', 'lz4') + (() if a.rebuild else ('zbic',)):
         try:
             __import__(mod)
