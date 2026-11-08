@@ -3,7 +3,7 @@
 # NX2navi
 
 **NX2navi** is a static recompilation of *The Legend of Zelda: Ocarina of Time* for Nintendo Switch 2 (game
-version 1.1.1) into a native x86-64 application for Windows, with a Vulkan renderer
+version 1.1.1) into a native x86-64 application for Windows and Linux, with a Vulkan renderer
 ([docs/architecture.md](docs/architecture.md)).
 
 > [!IMPORTANT]
@@ -54,9 +54,11 @@ it; afterwards it keeps the port up to date and rebuilds only what changed ([doc
 building from source. Settings are in the in-game menu and in `nx2navi.ini` ([nx2navi.ini.example](nx2navi.ini.example)
 lists every key). Controls: [docs/controls.md](docs/controls.md).
 
-Requirements: Windows 10 or later; an x86-64 CPU with SSE4.2 (AVX2/FMA machines get a faster build); 16 GB of RAM; about
+Requirements: Windows 10 or later, or x86-64 Linux 6.7 or later; an x86-64 CPU with SSE4.2 (AVX2/FMA machines get a
+faster build); 16 GB of RAM; about
 30 GB free for the game and 1.5 GB for the launcher and its tools; a GPU with Vulkan 1.3, `VK_EXT_external_memory_host`
-and `VK_EXT_mesh_shader`. The setup is not signed, so SmartScreen warns on its first start.
+and `VK_EXT_mesh_shader`. The setup and the launcher are Windows-only; on Linux the kit builds the game by hand
+([docs/README-BuildKit.md](docs/README-BuildKit.md)). The setup is not signed, so SmartScreen warns on its first start.
 
 ## Known issues
 

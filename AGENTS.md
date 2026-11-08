@@ -1,6 +1,6 @@
 # NX2navi
 
-Static recompilation of *Ocarina of Time* (Switch 2, ARM64, game version 1.1.1) into a native Windows x86-64 exe with a Vulkan renderer. Design: [docs/architecture.md](docs/architecture.md). Toolchain, build commands and tests: [docs/building.md](docs/building.md). The players' launcher, setup and updates: [docs/launcher.md](docs/launcher.md).
+Static recompilation of *Ocarina of Time* (Switch 2, ARM64, game version 1.1.1) into a native Windows and Linux x86-64 program with a Vulkan renderer. Design: [docs/architecture.md](docs/architecture.md). Toolchain, build commands and tests: [docs/building.md](docs/building.md). The players' launcher, setup and updates: [docs/launcher.md](docs/launcher.md).
 
 ## Game content boundary
 
@@ -21,8 +21,8 @@ The repository's additions are all rights reserved (`LICENSE-ADDITIONS`). It nev
 
 ## Code
 
-- Build C with MSYS2 UCRT64 Clang (`C:\msys64\ucrt64\bin`). Generated C uses GNU extensions, so `cl.exe` is out. Call Ninja from that directory by full path or put it first on PATH.
-- Two Python environments: `.venv` (3.12) for the lifter and the build, `.venv-py314` for the extraction and shader scripts, which need `compression.zstd`.
+- Build C with MSYS2 UCRT64 Clang (`C:\msys64\ucrt64\bin`). Generated C uses GNU extensions, so `cl.exe` is out. Call Ninja from that directory by full path or put it first on PATH. On Linux, the `clang`/`clang++` on PATH build the same sources against the system's SDL3, Vulkan, Opus, libvpx, dav1d and zstd.
+- Two Python environments: `.venv` (3.12) for the lifter and the build, `.venv-py314` for the extraction and shader scripts, which need `compression.zstd`. On Linux, the `.nup` build needs one 3.12 environment with numpy, lz4, zstandard and zbic; the shader tools fall back to the `zstandard` package.
 - Generated C is never edited by hand: change the generator (`recomp/`).
 - Every lifter change passes the differential tests against Unicorn ([docs/building.md](docs/building.md), "Checks"). After changing `recomp/jumptables.py`, `tests\jumptables_check.py` reports 0 disagreements on 1.2.1 and 1.4.3.
 - `recomp/layout.py` alone decides module bases.
