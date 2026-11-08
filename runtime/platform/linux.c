@@ -30,6 +30,7 @@
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <unwind.h>
 #include <unistd.h>
 
 #include <SDL3/SDL_clipboard.h>
@@ -313,6 +314,7 @@ __asm__(".text\n"
         ".p2align 4\n"
         "plat_fiber_entry:\n"
         "    movq %r13, %rdi\n"
+        "    subq $8, %rsp\n"      /* a call site keeps rsp 16-byte aligned: this entry got the return address's 8 */
         "    callq *%r12\n"
         "    ud2\n"
         ".size plat_fiber_entry, .-plat_fiber_entry\n");
@@ -968,9 +970,79 @@ void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
 
 void plat_crash_context(const char *s) { (void)s; }   // the Windows crash notes only
 
-int plat_frame_capture(PlatJmp *out, int (*want)(uintptr_t rip, void *arg), void *arg) {   // not on Linux yet
-    (void)out, (void)want, (void)arg;
-    return 0;
+// plat_jmp_save / plat_jmp_go: the SysV callee-saved registers (rbx, rbp, r12-r15) at 0..40, the caller's rsp and the
+// return address at 48 and 56, MXCSR and the x87 control word at 64 and 68. Both are leaf code that does not move rsp
+// before it leaves, so they need no unwind data.
+_Static_assert(sizeof(PlatJmp) == 72 && __builtin_offsetof(PlatJmp, mxcsr) == 64, "plat_jmp_save layout");
+__asm__(".text\n"
+        ".globl plat_jmp_save\n"
+        ".type plat_jmp_save, @function\n"
+        ".p2align 4\n"
+        "plat_jmp_save:\n"
+        "    movq %rbx, 0(%rdi)\n"
+        "    movq %rbp, 8(%rdi)\n"
+        "    movq %r12, 16(%rdi)\n"
+        "    movq %r13, 24(%rdi)\n"
+        "    movq %r14, 32(%rdi)\n"
+        "    movq %r15, 40(%rdi)\n"
+        "    leaq 8(%rsp), %rax\n"       /* the caller's rsp once this call returns */
+        "    movq %rax, 48(%rdi)\n"
+        "    movq (%rsp), %rax\n"
+        "    movq %rax, 56(%rdi)\n"
+        "    stmxcsr 64(%rdi)\n"
+        "    fnstcw 68(%rdi)\n"
+        "    xorl %eax, %eax\n"
+        "    ret\n"
+        ".size plat_jmp_save, .-plat_jmp_save\n"
+        ".globl plat_jmp_go\n"
+        ".type plat_jmp_go, @function\n"
+        ".p2align 4\n"
+        "plat_jmp_go:\n"
+        "    movq 0(%rdi), %rbx\n"
+        "    movq 8(%rdi), %rbp\n"
+        "    movq 16(%rdi), %r12\n"
+        "    movq 24(%rdi), %r13\n"
+        "    movq 32(%rdi), %r14\n"
+        "    movq 40(%rdi), %r15\n"
+        "    ldmxcsr 64(%rdi)\n"
+        "    fldcw 68(%rdi)\n"
+        "    movq 48(%rdi), %rsp\n"
+        "    movl $1, %eax\n"
+        "    jmpq *56(%rdi)\n"
+        ".size plat_jmp_go, .-plat_jmp_go\n");
+
+// plat_frame_capture: the DWARF unwinder walks the host frames from here; the first whose return address lies in the
+// lifted function want() accepts gives its callee-saved registers, CFA (the caller's rsp when the call returns) and
+// return address, which plat_jmp_go resumes.
+typedef struct {
+    PlatJmp *out;
+    int (*want)(uintptr_t rip, void *arg);
+    void *arg;
+    int found;
+} FrameCapture;
+
+static _Unwind_Reason_Code capture_frame(struct _Unwind_Context *ctx, void *p) {
+    FrameCapture *fc = p;
+    uintptr_t rip = (uintptr_t)_Unwind_GetIP(ctx);
+    if (!rip) return _URC_END_OF_STACK;
+    if (!fc->want(rip, fc->arg)) return _URC_NO_REASON;
+    fc->out->gpr[0] = (uint64_t)_Unwind_GetGR(ctx, 3);    // rbx
+    fc->out->gpr[1] = (uint64_t)_Unwind_GetGR(ctx, 6);    // rbp
+    fc->out->gpr[2] = (uint64_t)_Unwind_GetGR(ctx, 12);   // r12
+    fc->out->gpr[3] = (uint64_t)_Unwind_GetGR(ctx, 13);   // r13
+    fc->out->gpr[4] = (uint64_t)_Unwind_GetGR(ctx, 14);   // r14
+    fc->out->gpr[5] = (uint64_t)_Unwind_GetGR(ctx, 15);   // r15
+    fc->out->gpr[6] = (uint64_t)_Unwind_GetCFA(ctx);      // the caller's rsp on return
+    fc->out->gpr[7] = rip;                                // where the call returns to
+    __asm__ volatile("stmxcsr %0\n\tfnstcw %1" : "=m"(fc->out->mxcsr), "=m"(fc->out->fpcw));
+    fc->found = 1;
+    return _URC_END_OF_STACK;
+}
+
+int plat_frame_capture(PlatJmp *out, int (*want)(uintptr_t rip, void *arg), void *arg) {
+    FrameCapture fc = {out, want, arg, 0};
+    _Unwind_Backtrace(capture_frame, &fc);
+    return fc.found;
 }
 
 void plat_crash_hook(void (*fn)(const PlatCrash *c)) {

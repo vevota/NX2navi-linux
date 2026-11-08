@@ -70,14 +70,13 @@ void plat_fiber_free(PlatFiber *f);       // a fiber nobody runs
 // such a buffer when Control Flow Guard is on for the process, which Exploit protection can force on any program.
 #ifdef _WIN32
 typedef struct { uint64_t gpr[10]; uint32_t mxcsr, fpcw; uint64_t pad; uint8_t xmm[160]; } PlatJmp;
+#else
+// SysV x86-64 keeps rbx, rbp and r12-r15 across a call (no floating-point register does): gpr[0..5], then the caller's
+// rsp and the return address, and the floating-point control state the runtime sets for the guest's arithmetic.
+typedef struct { uint64_t gpr[8]; uint32_t mxcsr, fpcw; } PlatJmp;
+#endif
 int plat_jmp_save(PlatJmp *j) __attribute__((returns_twice, nothrow));
 _Noreturn void plat_jmp_go(PlatJmp *j);
-#else
-#include <setjmp.h>
-typedef struct { jmp_buf b; } PlatJmp;
-#define plat_jmp_save(j) setjmp((j)->b)
-#define plat_jmp_go(j) longjmp((j)->b, 1)
-#endif
 // The host state of a caller further up this thread's stack, as it will be when the call it is making returns: the
 // stack is unwound frame by frame (from the caller of this function) until want(return address, arg) accepts one, and
 // that frame's callee-saved registers, stack pointer and return address go to *out for plat_jmp_go, which then makes
